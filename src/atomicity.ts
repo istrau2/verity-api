@@ -1,4 +1,4 @@
-import { groqChatJSON } from "./groq";
+import { llmChatJSON, parseModelJSON } from "./llm";
 
 /**
  * Chain-independent, LLM-based judgment of a candidate claim. This is the check
@@ -37,20 +37,9 @@ Respond with ONLY this JSON shape, no prose:
 {"atomic": boolean, "subClaims": string[], "wellFormed": boolean, "verifiable": boolean, "reason": "one short sentence"}`;
 
 export async function assessClaim(text: string): Promise<AtomicityResult> {
-  const raw = await groqChatJSON(SYSTEM, `Claim: """${text}"""`);
-  const parsed = parseJson(raw);
+  const raw = await llmChatJSON(SYSTEM, `Claim: """${text}"""`);
+  const parsed = parseModelJSON(raw);
   return normalize(parsed, text);
-}
-
-/** Parse the first JSON object out of the model output; tolerant of stray prose. */
-function parseJson(s: string): Record<string, unknown> {
-  const start = s.indexOf("{");
-  if (start === -1) throw new Error("No JSON object in model response");
-  const decoded = JSON.parse(s.slice(start, s.lastIndexOf("}") + 1));
-  if (typeof decoded !== "object" || decoded === null) {
-    throw new Error("Model response was not a JSON object");
-  }
-  return decoded as Record<string, unknown>;
 }
 
 function normalize(p: Record<string, unknown>, original: string): AtomicityResult {
