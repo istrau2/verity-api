@@ -181,6 +181,59 @@ export async function getLivePost(postId: number): Promise<LivePost> {
   };
 }
 
+const LOT_ABI = [
+  {
+    type: "function",
+    name: "getUserLotInfo",
+    stateMutability: "view",
+    inputs: [
+      { name: "user", type: "address" },
+      { name: "postId", type: "uint256" },
+      { name: "side", type: "uint8" },
+    ],
+    outputs: [
+      { name: "amount", type: "uint256" },
+      { name: "weightedPosition", type: "uint256" },
+      { name: "entryEpoch", type: "uint256" },
+      { name: "sideTotal", type: "uint256" },
+      { name: "positionWeight", type: "uint256" },
+    ],
+  },
+] as const;
+
+export interface LotInfo {
+  /** Current projected value of the lot (principal ± settlement gains/losses), VSP. */
+  projectedVsp: number;
+  entryEpoch: number;
+  /** Early-staker advantage, 0..1 (1 = front of the queue). */
+  positionWeight: number;
+  /** The whole side's total, VSP. */
+  sideTotalVsp: number;
+}
+
+/** A user's live position on a post, both sides, straight from StakeEngine. */
+export async function getUserLot(postId: number, user: string): Promise<{ support: LotInfo | null; challenge: LotInfo | null }> {
+  const a = await getAddresses();
+  const addr = getAddress(user);
+  const read = async (side: 0 | 1): Promise<LotInfo | null> => {
+    const [amount, , entryEpoch, sideTotal, positionWeight] = (await publicClient.readContract({
+      address: a.stakeEngine as Hex,
+      abi: LOT_ABI,
+      functionName: "getUserLotInfo",
+      args: [addr, BigInt(postId), side],
+    })) as readonly [bigint, bigint, bigint, bigint, bigint];
+    if (amount === 0n) return null;
+    return {
+      projectedVsp: Number(amount) / 1e18,
+      entryEpoch: Number(entryEpoch),
+      positionWeight: Number(positionWeight) / 1e18,
+      sideTotalVsp: Number(sideTotal) / 1e18,
+    };
+  };
+  const [support, challenge] = await Promise.all([read(0), read(1)]);
+  return { support, challenge };
+}
+
 /** Build the {to, data, permitValueWei} for a supported write action. */
 export async function buildTx(
   action: "setStake" | "createClaim" | "approve",

@@ -6,7 +6,7 @@ import { assessClaim } from "./atomicity";
 import { decomposeSentences, DECOMPOSE_VERSION, type Decomposition, type InputSentence } from "./decompose";
 import { cacheGet, cacheSet, dedupInflight } from "./cache";
 import { appGet, appPost, AppError } from "./appClient";
-import { buildTx, getLivePost, getRelayConfig } from "./chain";
+import { buildTx, getLivePost, getRelayConfig, getUserLot } from "./chain";
 
 /**
  * verity-api — VALUE-ADD gateway only. The extension calls the app directly
@@ -274,6 +274,28 @@ app.get("/claims/:id/live", h(async (req, res) => {
     // Active = clears the protocol's activity threshold (the posting fee).
     active: totalWei >= BigInt(cfg.postingFeeWei),
   });
+}));
+
+/**
+ * A user's live position on a claim, from StakeEngine.getUserLotInfo: the
+ * PROJECTED lot value (principal ± epoch settlement gains/losses — i.e. the
+ * earnings signal), entry epoch, and queue position weight.
+ */
+app.get("/claims/:id/lot/:address", h(async (req, res) => {
+  const postId = Number(req.params.id);
+  const address = String(req.params.address ?? "");
+  if (!Number.isInteger(postId) || postId < 0 || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    return res.status(400).json({ error: "Invalid post id or address" });
+  }
+  const lot = await getUserLot(postId, address);
+  const side = (s: typeof lot.support) =>
+    s && {
+      projected_vsp: s.projectedVsp,
+      entry_epoch: s.entryEpoch,
+      position_weight: s.positionWeight,
+      side_total_vsp: s.sideTotalVsp,
+    };
+  res.json({ post_id: postId, support: side(lot.support), challenge: side(lot.challenge) });
 }));
 
 /**
