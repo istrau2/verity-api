@@ -7,6 +7,16 @@ import { decomposeSentences, DECOMPOSE_VERSION, type Decomposition, type InputSe
 import { cacheGet, cacheSet, dedupInflight } from "./cache";
 import { appGet, appPost, AppError } from "./appClient";
 import { buildTx, getLivePost, getRelayConfig, getUserLot } from "./chain";
+import {
+  canonicalHash,
+  claimHistory,
+  claimOccurrences,
+  lookupMatches,
+  persistMatch,
+  persistOccurrences,
+  pgEnabled,
+  positionHistory,
+} from "./pgstore";
 
 /**
  * verity-api — VALUE-ADD gateway only. The extension calls the app directly
@@ -55,17 +65,29 @@ type Match = { postId: number; similarity: number };
 const NEGATIVE_MATCH_TTL_MS = 90_000;
 
 /**
- * Embedding-match canonical texts against on-chain claims, with a per-text
- * cache (short TTL — chain state drifts). Canonical forms repeat across
- * paragraphs/articles, so this keeps repeated lookups off the app's
- * rate-limited match-batch endpoint. Misses (no on-chain match) are cached too.
+ * Match canonical texts against on-chain claims, three layers deep:
+ *   1. Postgres canonical_match (permanent — a matched claim never unmatches)
+ *   2. short-TTL cache (positive 60m / negative 90s, chain state drifts)
+ *   3. the app's rate-limited match-batch (embeddings) for the remainder
+ * Confirmed matches are persisted back to Postgres when available.
  */
 async function matchCanonicals(texts: string[]): Promise<Map<number, Match>> {
   const byIndex = new Map<number, Match>();
+
+  // Layer 1: permanent store.
+  const persisted = await lookupMatches(texts);
+  const remaining: number[] = [];
+  texts.forEach((t, i) => {
+    const hit = persisted.get(canonicalHash(t));
+    if (hit) byIndex.set(i, { postId: hit.postId, similarity: hit.similarity });
+    else remaining.push(i);
+  });
+
+  // Layer 2: cache.
   const missIdx: number[] = [];
   await Promise.all(
-    texts.map(async (t, i) => {
-      const hit = await cacheGet<{ m: Match | null }>(matchKey(t));
+    remaining.map(async (i) => {
+      const hit = await cacheGet<{ m: Match | null }>(matchKey(texts[i]));
       if (hit) {
         if (hit.m) byIndex.set(i, hit.m);
       } else {
@@ -94,11 +116,13 @@ async function matchCanonicals(texts: string[]): Promise<Map<number, Match>> {
       slice.map(async (origIdx, sliceIdx) => {
         const m = bySlice.get(sliceIdx) ?? null;
         if (m) byIndex.set(origIdx, m);
-        // Positive matches are stable (claims don't unmatch) → long TTL.
-        // Misses are short-lived: a freshly created claim shows up as soon as
-        // the app indexes its embedding, and a stale "no match" would hide the
-        // new underline from everyone for the full TTL.
+        // Positive matches are stable (claims don't unmatch) → long TTL, and
+        // persisted permanently when Postgres is around. Misses are
+        // short-lived: a freshly created claim shows up as soon as the app
+        // indexes its embedding, and a stale "no match" would hide the new
+        // underline from everyone for the full TTL.
         await cacheSet(matchKey(texts[origIdx]), { m }, m ? config.resolvedTtlMs : NEGATIVE_MATCH_TTL_MS);
+        if (m) await persistMatch(texts[origIdx], m.postId, m.similarity);
       }),
     );
   }
@@ -207,6 +231,22 @@ app.post("/article/claims", h(async (req, res) => {
     }),
   );
 
+  // Persist occurrences (canonical claim ↔ page location) so "where does this
+  // claim appear on Wikipedia" outlives the decomposition cache. Fire-and-forget.
+  if (pgEnabled) {
+    const rows = paragraphs.flatMap((p, i) =>
+      decomps[i].groups.map((g) => ({
+        text: g.canonicalText,
+        lang,
+        title,
+        revision: rev,
+        paragraphId: p.paragraphId,
+        sentenceIds: g.sentenceIds,
+      })),
+    );
+    void persistOccurrences(rows);
+  }
+
   // Merge groups across paragraphs — groupIds are content hashes, so the same
   // canonical claim in two paragraphs lands in one group.
   const merged = new Map<string, { canonicalText: string; sentenceIds: string[] }>();
@@ -298,6 +338,35 @@ app.get("/claims/:id/lot/:address", h(async (req, res) => {
   res.json({ post_id: postId, support: side(lot.support), challenge: side(lot.challenge) });
 }));
 
+// ── Historical series (ingestor-written Postgres; 503 when not configured) ──
+
+app.get("/positions/:address/:postId/history", h(async (req, res) => {
+  const postId = Number(req.params.postId);
+  const address = String(req.params.address ?? "");
+  if (!Number.isInteger(postId) || postId < 0 || !/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    return res.status(400).json({ error: "Invalid post id or address" });
+  }
+  const hist = await positionHistory(postId, address);
+  if (!hist) return res.status(503).json({ error: "History store not configured (DATABASE_URL)." });
+  res.json({ post_id: postId, ...hist });
+}));
+
+app.get("/claims/:id/history", h(async (req, res) => {
+  const postId = Number(req.params.id);
+  if (!Number.isInteger(postId) || postId < 0) return res.status(400).json({ error: "Invalid post id" });
+  const snapshots = await claimHistory(postId);
+  if (!snapshots) return res.status(503).json({ error: "History store not configured (DATABASE_URL)." });
+  res.json({ post_id: postId, snapshots });
+}));
+
+app.get("/claims/:id/occurrences", h(async (req, res) => {
+  const postId = Number(req.params.id);
+  if (!Number.isInteger(postId) || postId < 0) return res.status(400).json({ error: "Invalid post id" });
+  const occurrences = await claimOccurrences(postId);
+  if (!occurrences) return res.status(503).json({ error: "History store not configured (DATABASE_URL)." });
+  res.json({ post_id: postId, occurrences });
+}));
+
 /**
  * A claim was just created for this canonical text — seed the match cache with
  * the positive verdict so its underline survives page refreshes immediately
@@ -315,6 +384,7 @@ app.post("/claim-created", h(async (req, res) => {
   );
   if (chk?.exists && chk.post_id != null) {
     await cacheSet(matchKey(text), { m: { postId: chk.post_id, similarity: 1 } }, config.resolvedTtlMs);
+    await persistMatch(text, chk.post_id, 1);
     return res.json({ seeded: true, post_id: chk.post_id });
   }
   res.json({ seeded: false });

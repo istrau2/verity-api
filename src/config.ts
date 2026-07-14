@@ -57,6 +57,12 @@ export const config = {
    * across replicated instances; unset falls back to a local SQLite file.
    */
   redisUrl: process.env.REDIS_URL ?? "",
+  /**
+   * Optional: the verity-ingestor Postgres. When set, the gateway persists
+   * wiki occurrences + canonical→claim matches there (and reads matches back,
+   * skipping the app's rate-limited match-batch for known texts).
+   */
+  databaseUrl: process.env.DATABASE_URL ?? "",
   /** Directory for the SQLite cache file (single-node fallback). */
   cacheDir: process.env.CACHE_DIR ?? "./data",
   /** TTL for the text-only decomposition layer (revision-keyed). */
